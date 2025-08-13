@@ -1,15 +1,16 @@
 import os
 import asyncio
 import contextlib
+import wave
 from typing import List, Optional
 
 import vertexai
 from vertexai.preview import rag
 
 from google import genai
-from google.genai import types
 from google.genai.types import (
     Content,
+    HttpOptions,
     LiveConnectConfig,
     Modality,
     Part,
@@ -17,22 +18,22 @@ from google.genai.types import (
     Retrieval,
     VertexRagStore,
     VertexRagStoreRagResource,
+    SpeechConfig,
+    VoiceConfig,
+    PrebuiltVoiceConfig,
 )
 
 # ----------- Config ----------
 PROJECT_ID = os.getenv("PROJECT_ID", "vet-vocals")
-LOCATION = os.getenv("LOCATION", "us-central1")
+LOCATION = os.getenv("LOCATION", "us-central1")  # your RAG region (corpora live here)
 
-# Live model: keep your choice; if you get a "model not found" error, try gemini-2.0-flash-exp
+# Keep your chosen Live model UNCHANGED:
 MODEL_ID = os.getenv("MODEL_ID", "gemini-live-2.5-flash-preview-native-audio")
 
-# Embedding model for both corpora
-EMBED_MODEL = os.getenv(
-    "EMBED_MODEL",
-    "publishers/google/models/gemini-embedding-001",
-)
+# Embedding model for corpora
+EMBED_MODEL = os.getenv("EMBED_MODEL", "publishers/google/models/gemini-embedding-001")
 
-# LLM parser used by the MemoryCorpus (must be full resource name)
+# LLM parser for MemoryCorpus (full resource name)
 LLM_PARSER = os.getenv(
     "LLM_PARSER",
     f"projects/{PROJECT_ID}/locations/{LOCATION}/publishers/google/models/gemini-2.5-flash",
@@ -41,8 +42,7 @@ LLM_PARSER = os.getenv(
 KB_DISPLAY = os.getenv("KB_DISPLAY", "kb-corpus")
 MEM_DISPLAY = os.getenv("MEM_DISPLAY", "live-session-memory")
 
-# Comma-separated GCS/Drive sources, e.g.:
-#   export KB_GCS_URIS="gs://my-bucket/folder,gs://my-bucket/doc.pdf"
+# Optional: comma-separated GCS/Drive sources for KB import
 KB_GCS_URIS = [p.strip() for p in os.getenv("KB_GCS_URIS", "").split(",") if p.strip()]
 
 
@@ -66,7 +66,6 @@ def ensure_kb_corpus() -> rag.RagCorpus:
     print("[*] Creating KB (document) corpus…")
     created = rag.create_corpus(
         display_name=KB_DISPLAY,
-        # default type = DocumentCorpus
         backend_config=rag.RagVectorDbConfig(
             rag_embedding_model_config=rag.RagEmbeddingModelConfig(
                 vertex_prediction_endpoint=rag.VertexPredictionEndpoint(
@@ -115,14 +114,21 @@ def import_kb_files(kb_corpus_name: str, paths: List[str]):
         transformation_config=rag.TransformationConfig(
             chunking_config=rag.ChunkingConfig(chunk_size=512, chunk_overlap=64)
         ),
-        # throttle embedding calls if desired (default ~1000 QPM):
         max_embedding_requests_per_min=900,
     )
-    # Indexing is async; large imports take time
     print(
         f"[✓] Import started. Imported={getattr(resp, 'imported_rag_files_count', 'N/A')} "
         f"Skipped={getattr(resp, 'skipped_rag_files_count', 'N/A')}"
     )
+
+
+def write_wav_from_pcm16(audio_bytes: bytes, path: str, sample_rate: int = 24000):
+    """Wrap raw 16-bit PCM @24kHz in a WAV container so you can play it easily."""
+    with wave.open(path, "wb") as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(2)  # 16-bit
+        wf.setframerate(sample_rate)
+        wf.writeframes(audio_bytes)
 
 
 async def live_chat(kb_corpus_name: str, mem_corpus_name: str):
@@ -135,24 +141,68 @@ async def live_chat(kb_corpus_name: str, mem_corpus_name: str):
         store_context=True,
     )
 
-    client = genai.Client(vertexai=True, project=PROJECT_ID, location=LOCATION)
+    # Live API: use global + v1beta1
+    client = genai.Client(
+        vertexai=True,
+        project=PROJECT_ID,
+        location="global",
+        http_options=HttpOptions(api_version="v1beta1"),
+    )
 
-    print("\n[Live] Connecting… Type your message and press Enter. Ctrl+C to exit.\n")
-    async with client.aio.live.connect(
-        model=MODEL_ID,
-        config=LiveConnectConfig(
+    wants_native_audio = "native-audio" in MODEL_ID
+
+    if wants_native_audio:
+        # Native-audio models require AUDIO modality
+        live_config = LiveConnectConfig(
+            response_modalities=[Modality.AUDIO],
+            speech_config=SpeechConfig(
+                voice=VoiceConfig(
+                    prebuilt_voice_config=PrebuiltVoiceConfig(voice_name="Aoede")
+                )
+            ),
+            tools=[
+                Tool(retrieval=Retrieval(vertex_rag_store=kb_store)),
+                Tool(retrieval=Retrieval(vertex_rag_store=memory_store)),
+            ],
+        )
+    else:
+        live_config = LiveConnectConfig(
             response_modalities=[Modality.TEXT],
             tools=[
                 Tool(retrieval=Retrieval(vertex_rag_store=kb_store)),
                 Tool(retrieval=Retrieval(vertex_rag_store=memory_store)),
             ],
-        ),
-    ) as session:
+        )
+
+    print("\n[Live] Connecting… Type your message and press Enter. Ctrl+C to exit.\n")
+    async with client.aio.live.connect(model=MODEL_ID, config=live_config) as session:
+        # Collect audio data (for native-audio replies)
+        audio_buf = bytearray()
 
         async def receiver():
+            nonlocal audio_buf
             async for msg in session.receive():
+                # Text (for non-native-audio models)
                 if msg.text:
                     print(f"\n[Gemini]: {msg.text}\n", flush=True)
+                    continue
+
+                # Audio (for native-audio models)
+                sc = getattr(msg, "server_content", None)
+                if sc and getattr(sc, "model_turn", None) and sc.model_turn.parts:
+                    for part in sc.model_turn.parts:
+                        inline = getattr(part, "inline_data", None)
+                        if inline and getattr(inline, "data", None):
+                            audio_buf.extend(inline.data)
+
+                # When the turn completes, dump audio (if any) to a WAV file
+                if sc and getattr(sc, "turn_complete", False) and audio_buf:
+                    out_path = "last_reply.wav"
+                    write_wav_from_pcm16(bytes(audio_buf), out_path, sample_rate=24000)
+                    print(
+                        f"\n[Gemini]: (audio reply saved to ./{out_path})\n", flush=True
+                    )
+                    audio_buf = bytearray()
 
         recv_task = asyncio.create_task(receiver())
 
